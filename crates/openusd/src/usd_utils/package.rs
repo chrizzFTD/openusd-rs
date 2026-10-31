@@ -61,6 +61,33 @@ pub fn create_usdz_package<'a>(
     usdz_file_path: impl AsRef<Path>,
     first_layer_name: Option<&str>,
 ) -> Result<Vec<String>> {
+    let (built, skipped) = build_usdz_package(stage, root, first_layer_name)?;
+    let mut temp = tf::SafeOutputFile::create(usdz_file_path.as_ref())?;
+    temp.file().write_all(&built)?;
+    temp.persist()?;
+    Ok(skipped)
+}
+
+/// Like [`create_usdz_package`], but returns the archive bytes instead of
+/// writing a file. Use this when the host has no filesystem (browser wasm) or
+/// when the caller will hand the package to another API (blob URL, upload).
+///
+/// The returned bytes are a complete USDZ ZIP. `skipped` is the same layer
+/// dependency list [`create_usdz_package`] returns.
+pub fn create_usdz_package_bytes<'a>(
+    stage: &Stage,
+    root: impl Into<Root<'a>>,
+    first_layer_name: Option<&str>,
+) -> Result<(Vec<u8>, Vec<String>)> {
+    build_usdz_package(stage, root, first_layer_name)
+}
+
+/// Discovers dependencies and serializes them into an in-memory USDZ archive.
+fn build_usdz_package<'a>(
+    stage: &Stage,
+    root: impl Into<Root<'a>>,
+    first_layer_name: Option<&str>,
+) -> Result<(Vec<u8>, Vec<String>)> {
     let graph = stage.layer_view()?;
     let policy = Discover {
         inactive: true,
@@ -96,12 +123,10 @@ pub fn create_usdz_package<'a>(
     }
     let entries = assign_entries(&discovery, &name, HashSet::new());
 
-    let mut temp = tf::SafeOutputFile::create(usdz_file_path.as_ref())?;
-    let mut archive = usdz::ArchiveWriter::new(temp.file());
+    let mut archive = usdz::ArchiveWriter::new(Cursor::new(Vec::new()));
     write_entries(&graph, &discovery, &entries, &mut archive)?;
-    archive.finish()?;
-    temp.persist()?;
-    Ok(skipped)
+    let cursor = archive.finish()?;
+    Ok((cursor.into_inner(), skipped))
 }
 
 /// Where a scope's sources are stored: one entry per source, and the entries
@@ -592,6 +617,27 @@ def "T"
         assert_eq!(entries(&output).0, ["scene.usdc"]);
         let packaged = Stage::open(output.to_str().unwrap())?;
         assert!(packaged.prim("/Edited")?.is_valid()?);
+        Ok(())
+    }
+
+    /// In-memory packaging matches the on-disk package for the same root.
+    #[test]
+    fn package_bytes_match_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        write(dir.path(), "tex.png", "PNG");
+        write(
+            dir.path(),
+            "root.usda",
+            "#usda 1.0\ndef \"A\" {\n    asset t = @./tex.png@\n    int probe = 7\n}\n",
+        );
+        let (root, stage) = open(dir.path(), "root.usda")?;
+        let output = dir.path().join("out.usdz");
+        let skipped_file = create_usdz_package(&stage, &root, &output, None)?;
+        let (bytes, skipped_bytes) = create_usdz_package_bytes(&stage, &root, None)?;
+        assert_eq!(skipped_file, skipped_bytes);
+        assert_eq!(bytes, fs::read(&output)?);
+        let packaged = Stage::open(output.to_str().unwrap())?;
+        assert_eq!(attribute_value(&packaged, "/A.probe"), Some(vt::Value::Int(7)));
         Ok(())
     }
 
