@@ -797,20 +797,22 @@ impl Resolver for DefaultResolver {
         if let Some(anchor) = anchor {
             let anchor_str = anchor.to_string_lossy();
             // Anchor lives inside a package (`pkg.usdz[inner/layer.usd]`): keep
-            // the reference inside the package, relative to the inner layer's
-            // directory → `pkg.usdz[inner/asset.usd]`.
+            // the reference inside the package. File-relative paths (`./`, `../`)
+            // always join against the authoring layer's directory. Search paths
+            // try that join first, then the package default layer's directory
+            // (USDZ spec search-path pre-resolution), and otherwise stay bare
+            // for ordinary Ar search — matching the filesystem search-path rule
+            // in [`anchor_in`].
             if is_package_relative_path(&anchor_str)
                 && let Some((package, inner)) = split_package_relative_path_inner(&anchor_str)
             {
-                let inner_dir = inner.rsplit_once('/').map_or("", |(dir, _)| dir);
-                let joined = join_packaged_path(inner_dir, asset_path);
-                return nest_packaged_path(&package, &joined);
+                return identify_packaged_relative(self, &package, &inner, asset_path, &path);
             }
             // Anchor IS a package file (`foo.usdz`): a relative reference from
-            // the package's root layer is package-relative → `foo.usdz[asset]`.
+            // the package itself (before default-layer resolve) uses the same
+            // packaged search rules with an empty authoring directory.
             if anchor_str.to_ascii_lowercase().ends_with(".usdz") {
-                let joined = join_packaged_path("", asset_path);
-                return join_package_relative_path(&anchor_str, &joined);
+                return identify_packaged_relative(self, &anchor_str, "", asset_path, &path);
             }
             if let Some(dir) = anchor.parent() {
                 return anchor_in(dir, &path, asset_path);
@@ -1373,6 +1375,52 @@ pub(crate) fn split_file_name(path: &str) -> (&str, &str) {
     let inner = &path[span.clone()];
     let name = inner.rfind(SEPARATORS).map_or(0, |i| i + 1);
     (&path[..span.start + name], &inner[name..])
+}
+
+/// Identifier for a relative `asset_path` authored inside the package at
+/// `package`, from the packaged layer `authoring_inner` (empty when the
+/// anchor is the bare package).
+///
+/// File-relative paths join against the authoring layer's directory. Search
+/// paths try that join when the entry exists, then the package default
+/// layer's directory (USDZ search-path pre-resolution), and otherwise stay
+/// as the normalized authored spelling for ordinary Ar search.
+fn identify_packaged_relative(
+    resolver: &dyn Resolver,
+    package: &str,
+    authoring_inner: &str,
+    asset_path: &str,
+    normalized: &Path,
+) -> String {
+    let authoring_dir = authoring_inner.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let authored_join = join_packaged_path(authoring_dir, asset_path);
+    if is_file_relative_path(asset_path) {
+        return nest_packaged_path(package, &authored_join);
+    }
+    if usdz::package_contains(resolver, package, &authored_join) {
+        return nest_packaged_path(package, &authored_join);
+    }
+    if let Some(default_dir) = package_default_dir(resolver, package)
+        && default_dir != authoring_dir
+    {
+        let fallback = join_packaged_path(&default_dir, asset_path);
+        if usdz::package_contains(resolver, package, &fallback) {
+            return nest_packaged_path(package, &fallback);
+        }
+    }
+    normalized.to_string_lossy().into_owned()
+}
+
+/// Directory of the package's default (first) layer inside `package`, or
+/// `None` when the package cannot be opened or lists no layer.
+fn package_default_dir(resolver: &dyn Resolver, package: &str) -> Option<String> {
+    let opened = usdz::open_package(resolver, &ResolvedPath::new(package)).ok()?;
+    let first = opened.with(|archive| archive.first_layer_name().ok().flatten())?;
+    Some(
+        first
+            .rsplit_once('/')
+            .map_or_else(String::new, |(dir, _)| dir.to_owned()),
+    )
 }
 
 /// Joins a package-internal directory with a relative reference authored inside
@@ -1987,6 +2035,71 @@ pub(crate) mod tests {
             resolver.create_identifier("../tex/foo.usda", Some(&anchor)),
             "pkg.usdz[tex/foo.usda]",
         );
+    }
+
+    /// Search paths inside a package prefer the authoring layer's directory,
+    /// then the package default layer's directory (USDZ spec). ALab-style
+    /// packages keep entity layers at their original paths while numbered
+    /// dependencies sit beside the default layer under a subdirectory.
+    #[test]
+    fn packaged_search_path_falls_back_to_default_layer_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scene.usdz");
+        let mut writer = usdz::ArchiveWriter::create(&path).unwrap();
+        writer
+            .add_layer(
+                "al/pkg/root.usda",
+                b"#usda 1.0\n(\n    defaultPrim = \"root\"\n    subLayers = [\n        @0/assembly.usda@\n    ]\n)\n\ndef \"root\" {}\n",
+            )
+            .unwrap();
+        writer
+            .add_layer(
+                "al/pkg/0/assembly.usda",
+                b"#usda 1.0\ndef Xform \"root\" {\n    def Xform \"prop\" (instanceable = true\n        prepend references = @../../../entity/prop/prop.usda@)\n    {}\n}\n",
+            )
+            .unwrap();
+        writer
+            .add_layer(
+                "entity/prop/prop.usda",
+                b"#usda 1.0\n(\n    defaultPrim = \"root\"\n    subLayers = [\n        @1/prop_geo.usda@\n    ]\n)\ndef \"root\" {}\n",
+            )
+            .unwrap();
+        writer
+            .add_layer(
+                "al/pkg/1/prop_geo.usda",
+                b"#usda 1.0\ndef Xform \"root\" {\n    def Mesh \"GEO\" {\n        point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]\n        int[] faceVertexCounts = [3]\n        int[] faceVertexIndices = [0, 1, 2]\n    }\n}\n",
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let resolver = DefaultResolver::new();
+        let package = path.to_string_lossy().into_owned();
+        let entity_anchor = ResolvedPath::new(join_package_relative_path(&package, "entity/prop/prop.usda"));
+
+        assert_eq!(
+            resolver.create_identifier("1/prop_geo.usda", Some(&entity_anchor)),
+            join_package_relative_path(&package, "al/pkg/1/prop_geo.usda"),
+        );
+        assert_eq!(
+            resolver.create_identifier("./1/prop_geo.usda", Some(&entity_anchor)),
+            join_package_relative_path(&package, "entity/prop/1/prop_geo.usda"),
+        );
+
+        let stage = crate::usd::Stage::open(&package).expect("open packaged stage");
+        let mut meshes = 0usize;
+        stage
+            .traverse(crate::usd::PrimPredicate::DEFAULT_PROXIES, |path| {
+                if stage
+                    .prim(path)
+                    .ok()
+                    .and_then(|p| p.type_name().ok().flatten())
+                    .is_some_and(|t| t.as_str() == "Mesh")
+                {
+                    meshes += 1;
+                }
+            })
+            .expect("traverse");
+        assert_eq!(meshes, 1, "search-path sublayer under default-layer dir must compose");
     }
 
     #[test]
